@@ -25,6 +25,31 @@ function validateClassCode(classCode) {
     }
 }
 
+// 设备登录：用 deviceId 作为用户名的一部分，注册或登录并返回 sessionToken
+AV.Cloud.define('deviceLogin', async (request) => {
+    const { deviceId } = getParams(request);
+    if (!deviceId || typeof deviceId !== 'string') {
+        throw new AV.Cloud.Error('缺少 deviceId', { code: 400 });
+    }
+    const username = `dev-${deviceId}`;
+    const password = deviceId; // 简化：用 deviceId 作为密码（仅供原型使用）
+
+    try {
+        const user = new AV.User();
+        user.setUsername(username);
+        user.setPassword(password);
+        await user.signUp();
+        return { success: true, objectId: user.id, sessionToken: user.getSessionToken() };
+    } catch (e) {
+        if (e && e.code === 202) { // 用户名已存在
+            const user = await AV.User.logIn(username, password);
+            return { success: true, objectId: user.id, sessionToken: user.getSessionToken() };
+        }
+        console.error('deviceLogin error:', e);
+        throw new AV.Cloud.Error('设备登录失败', { code: 500 });
+    }
+});
+
 // 创建班级
 AV.Cloud.define('createClass', async (request) => {
     const user = request.currentUser;
