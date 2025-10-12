@@ -7,7 +7,8 @@
   },
   "dependencies": {
     "leanengine": "^3.0.0",
-    "leancloud-storage": "^4.13.0"
+    "leancloud-storage": "^4.13.0",
+    "express": "^4.17.1"
   },
   "engines": {
     "node": "18.x"
