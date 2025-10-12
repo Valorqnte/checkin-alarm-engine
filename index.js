@@ -7,10 +7,19 @@ function getParams(request) {
     return (request && request.params) ? request.params : {};
 }
 
+// 安全查询：表不存在时返回 null（避免首次访问报 101/404）
 async function getClassByCode(classCode) {
     const q = new AV.Query('Class');
     q.equalTo('classCode', classCode);
-    return q.first();
+    try {
+        return await q.first();
+    } catch (e) {
+        // 101: Class or object doesn't exists（LeanCloud 常见错误码）
+        if (e && (e.code === 101 || String(e.message || '').includes("doesn't exists"))) {
+            return null;
+        }
+        throw e;
+    }
 }
 
 function ensureLoggedIn(user) {
@@ -25,14 +34,14 @@ function validateClassCode(classCode) {
     }
 }
 
-// 设备登录：用 deviceId 作为用户名的一部分，注册或登录并返回 sessionToken
+// 设备登录：用 deviceId 注册或登录，返回 sessionToken
 AV.Cloud.define('deviceLogin', async (request) => {
     const { deviceId } = getParams(request);
     if (!deviceId || typeof deviceId !== 'string') {
         throw new AV.Cloud.Error('缺少 deviceId', { code: 400 });
     }
     const username = `dev-${deviceId}`;
-    const password = deviceId; // 简化：用 deviceId 作为密码（仅供原型使用）
+    const password = deviceId;
 
     try {
         const user = new AV.User();
@@ -41,7 +50,7 @@ AV.Cloud.define('deviceLogin', async (request) => {
         await user.signUp();
         return { success: true, objectId: user.id, sessionToken: user.getSessionToken() };
     } catch (e) {
-        if (e && e.code === 202) { // 用户名已存在
+        if (e && e.code === 202) {
             const user = await AV.User.logIn(username, password);
             return { success: true, objectId: user.id, sessionToken: user.getSessionToken() };
         }
@@ -50,7 +59,7 @@ AV.Cloud.define('deviceLogin', async (request) => {
     }
 });
 
-// 创建班级
+// 创建班级：若不存在则创建
 AV.Cloud.define('createClass', async (request) => {
     const user = request.currentUser;
     const { classCode } = getParams(request);
@@ -59,7 +68,9 @@ AV.Cloud.define('createClass', async (request) => {
     validateClassCode(classCode);
 
     const existed = await getClassByCode(classCode);
-    if (existed) throw new AV.Cloud.Error('班级码已存在，请换一个。', { code: 409 });
+    if (existed) {
+        throw new AV.Cloud.Error('班级码已存在，请换一个。', { code: 409 });
+    }
 
     const obj = new AV.Object('Class');
     obj.set('classCode', classCode);
@@ -80,7 +91,9 @@ AV.Cloud.define('joinClass', async (request) => {
     validateClassCode(classCode);
 
     const target = await getClassByCode(classCode);
-    if (!target) throw new AV.Cloud.Error('未找到该班级。', { code: 404 });
+    if (!target) {
+        throw new AV.Cloud.Error('未找到该班级。', { code: 404 });
+    }
 
     const members = target.get('members') || [];
     const set = new Set(members);
@@ -106,7 +119,9 @@ AV.Cloud.define('leaveClass', async (request) => {
     validateClassCode(classCode);
 
     const target = await getClassByCode(classCode);
-    if (!target) throw new AV.Cloud.Error('未找到该班级。', { code: 404 });
+    if (!target) {
+        throw new AV.Cloud.Error('未找到该班级。', { code: 404 });
+    }
 
     const members = target.get('members') || [];
     const newMembers = members.filter(id => id !== user.id);
@@ -132,7 +147,9 @@ AV.Cloud.define('getClassInfo', async (request) => {
     validateClassCode(classCode);
 
     const target = await getClassByCode(classCode);
-    if (!target) throw new AV.Cloud.Error('未找到该班级。', { code: 404 });
+    if (!target) {
+        throw new AV.Cloud.Error('未找到该班级。', { code: 404 });
+    }
 
     const members = target.get('members') || [];
     const memberCount = target.get('memberCount') ?? members.length;
@@ -164,7 +181,9 @@ AV.Cloud.define('sendAlarm', async (request) => {
     validateClassCode(classCode);
 
     const targetClass = await getClassByCode(classCode);
-    if (!targetClass) throw new AV.Cloud.Error('未找到该班级。', { code: 404 });
+    if (!targetClass) {
+        throw new AV.Cloud.Error('未找到该班级。', { code: 404 });
+    }
 
     const members = targetClass.get('members') || [];
     if (!members.includes(user.id)) {
