@@ -199,7 +199,7 @@ AV.Cloud.define('getClassInfo', async (request) => {
     };
 });
 
-// 发送闹铃：按 Group.members 推送；不回滚 lastAlarmAt；直推 + 关键日志
+// 发送闹铃：仅向开启了 notificationsEnabled 的 iOS 安装推送（不回滚 lastAlarmAt）
 AV.Cloud.define('sendAlarm', async (request) => {
     const user = request.currentUser;
     const { classCode, alarmType } = request.params || {};
@@ -216,9 +216,8 @@ AV.Cloud.define('sendAlarm', async (request) => {
     const group = await gq.first();
     if (!group) throw new AV.Cloud.Error('未找到该班级。', { code: 404 });
 
-    // 成员校验（成员应为用户 objectId 字符串数组）
+    // 成员校验
     const members = group.get('members') || [];
-    console.log(`[sendAlarm] class=${classCode} sender=${user.id} members=${JSON.stringify(members)}`);
     if (!members.includes(user.id)) {
         throw new AV.Cloud.Error('你不在该班级中，无法发送提醒。', { code: 403 });
     }
@@ -233,33 +232,37 @@ AV.Cloud.define('sendAlarm', async (request) => {
         }
     }
 
-    // 更新冷却时间（按你的要求：不做回滚）
+    // 写入冷却时间（按你的要求：不做回滚）
     group.set('lastAlarmAt', new Date(now));
     await group.save();
 
     // 目标用户：排除自己
     const recipientIds = members.filter(id => id !== user.id);
-    console.log(`[sendAlarm] class=${classCode} recipients=${JSON.stringify(recipientIds)}`);
     if (recipientIds.length === 0) {
         return { success: true, count: 0, memberCount: members.length, message: '班级只有你一人，无需推送。' };
     }
 
-    // 构造 Installation 查询：iOS、有 token、user 指向收件人
+    // 构造 Installation 查询：
+    // - iOS
+    // - 有 token
+    // - user 在 recipients
+    // - notificationsEnabled == true
     const where = new AV.Query('_Installation');
     where.equalTo('deviceType', 'ios');
     where.exists('deviceToken');
+    where.equalTo('notificationsEnabled', true);
     where.containedIn('user', recipientIds.map(id => AV.Object.createWithoutData('_User', id)));
 
-    // 推送文案
+    // 文案
     let alertMessage = '';
     if (alarmType === 'checkin') alertMessage = '班级有同学签到，速来！';
     else if (alarmType === 'rollcall') alertMessage = '老师开始点名，速来！';
     else alertMessage = '快来集合，有情况！';
 
     const data = { alert: alertMessage, sound: 'alarm.caf', badge: 'Increment' };
-    const prod = process.env.PUSH_ENV || 'dev'; // 你现在是 Xcode 安装，保持 dev。TestFlight/上架时把环境变量改为 prod。
+    const prod = process.env.PUSH_ENV || 'dev'; // 开发阶段用 dev；TestFlight/上架设为 prod
 
-    console.log(`[sendAlarm] class=${classCode} prod=${prod} pushing...`);
+    // 使用 where（不是 query）
     await AV.Push.send({ where, data, prod });
     return { success: true, count: recipientIds.length, memberCount: members.length };
 });
