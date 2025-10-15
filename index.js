@@ -200,22 +200,31 @@ AV.Cloud.define('getClassInfo', async (request) => {
 });
 
 // 发送闹铃（班级级别 60s 冷却）
+// 发送闹铃：正确筛选 Installation，默认走开发通道（不回滚 lastAlarmAt）
 AV.Cloud.define('sendAlarm', async (request) => {
     const user = request.currentUser;
-    const { classCode, alarmType } = getParams(request);
+    const { classCode, alarmType } = request.params || {};
+    const COOLDOWN_SECONDS = 60;
 
-    ensureLoggedIn(user);
-    validateClassCode(classCode);
+    if (!user) throw new AV.Cloud.Error('用户未登录，禁止操作。', { code: 401 });
+    if (!classCode || typeof classCode !== 'string' || classCode.length !== 6) {
+        throw new AV.Cloud.Error('班级码格式不正确。', { code: 400 });
+    }
 
-    const target = await getGroupByCode(classCode);
-    if (!target) throw new AV.Cloud.Error('未找到该班级。', { code: 404 });
+    // 找群组
+    const gq = new AV.Query('Group');
+    gq.equalTo('code', classCode);
+    const group = await gq.first();
+    if (!group) throw new AV.Cloud.Error('未找到该班级。', { code: 404 });
 
-    const members = target.get('members') || [];
+    // 成员校验
+    const members = group.get('members') || [];
     if (!members.includes(user.id)) {
         throw new AV.Cloud.Error('你不在该班级中，无法发送提醒。', { code: 403 });
     }
 
-    const last = target.get('lastAlarmAt');
+    // 冷却检查
+    const last = group.get('lastAlarmAt');
     const now = Date.now();
     if (last) {
         const elapsed = (now - new Date(last).getTime()) / 1000;
@@ -224,29 +233,41 @@ AV.Cloud.define('sendAlarm', async (request) => {
         }
     }
 
-    target.set('lastAlarmAt', new Date(now));
-    await target.save();
+    // 更新冷却时间（按你的要求：不做回滚）
+    group.set('lastAlarmAt', new Date(now));
+    await group.save();
 
+    // 目标用户：排除自己
+    const recipientIds = members.filter(id => id !== user.id);
+    if (recipientIds.length === 0) {
+        return { success: true, count: 0, memberCount: members.length, message: '班级只有你一人，无需推送。' };
+    }
+
+    // 构造 Installation 查询：iOS、有 token、user 指向收件人
+    const where = new AV.Query('_Installation');
+    where.equalTo('deviceType', 'ios');
+    where.exists('deviceToken');
+    where.containedIn('user', recipientIds.map(id => AV.Object.createWithoutData('_User', id)));
+
+    // 统计一下，便于你确认不是“0 目标”
+    const targetCount = await where.count().catch(() => 0);
+    console.log(`[sendAlarm] class=${classCode} sender=${user.id} targetInstallations=${targetCount}`);
+    if (targetCount === 0) {
+        return { success: true, count: 0, memberCount: members.length, message: '没有匹配的目标设备。' };
+    }
+
+    // 推送文案
     let alertMessage = '';
     if (alarmType === 'checkin') alertMessage = '班级有同学签到，速来！';
     else if (alarmType === 'rollcall') alertMessage = '老师开始点名，速来！';
     else alertMessage = '快来集合，有情况！';
 
-    const recipientIds = members.filter(id => id !== user.id);
-    if (recipientIds.length === 0) {
-        return { success: true, message: '没有其他成员需要通知。', count: 0, memberCount: members.length };
-    }
+    const data = { alert: alertMessage, sound: 'alarm.caf', badge: 'Increment' };
 
-    const pushQuery = new AV.Query('_Installation');
-    pushQuery.containedIn('user', recipientIds.map(id => AV.Object.createWithoutData('_User', id)));
+    // 环境：默认开发通道（Xcode 安装的包）。需要测生产时，到环境变量把 PUSH_ENV 改为 prod。
+    const prod = process.env.PUSH_ENV || 'dev';
 
-    const pushData = { alert: alertMessage, sound: 'alarm.caf', badge: 'Increment' };
-
-    try {
-        await AV.Push.send({ query: pushQuery, data: pushData });
-        return { success: true, count: recipientIds.length, memberCount: members.length };
-    } catch (error) {
-        console.error('推送发送失败:', error);
-        throw new AV.Cloud.Error('推送发送失败，请稍后重试。', { code: 500 });
-    }
+    // 注意：LeanCloud Node SDK 正确的参数名是 where（不是 query）
+    await AV.Push.send({ where, data, prod });
+    return { success: true, count: targetCount, memberCount: members.length };
 });
