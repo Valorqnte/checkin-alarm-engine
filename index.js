@@ -199,30 +199,28 @@ AV.Cloud.define('getClassInfo', async (request) => {
     };
 });
 
-// 发送闹铃：仅向开启了 notificationsEnabled 的 iOS 安装推送（不回滚 lastAlarmAt）
+// 云引擎 sendAlarm：日志脱敏（不打印完整用户ID/班级码）；不回滚 lastAlarmAt；按 pushEnv 分流
 AV.Cloud.define('sendAlarm', async (request) => {
     const user = request.currentUser;
     const { classCode, alarmType } = request.params || {};
     const COOLDOWN_SECONDS = 60;
+    const mask = s => (typeof s === 'string' && s.length >= 10) ? `${s.slice(0,6)}…${s.slice(-4)}` : s;
 
     if (!user) throw new AV.Cloud.Error('用户未登录，禁止操作。', { code: 401 });
     if (!classCode || typeof classCode !== 'string' || classCode.length !== 6) {
         throw new AV.Cloud.Error('班级码格式不正确。', { code: 400 });
     }
 
-    // 取群组
     const gq = new AV.Query('Group');
     gq.equalTo('code', classCode);
     const group = await gq.first();
     if (!group) throw new AV.Cloud.Error('未找到该班级。', { code: 404 });
 
-    // 成员校验
     const members = group.get('members') || [];
     if (!members.includes(user.id)) {
         throw new AV.Cloud.Error('你不在该班级中，无法发送提醒。', { code: 403 });
     }
 
-    // 冷却检查
     const last = group.get('lastAlarmAt');
     const now = Date.now();
     if (last) {
@@ -232,37 +230,48 @@ AV.Cloud.define('sendAlarm', async (request) => {
         }
     }
 
-    // 写入冷却时间（按你的要求：不做回滚）
     group.set('lastAlarmAt', new Date(now));
     await group.save();
 
-    // 目标用户：排除自己
     const recipientIds = members.filter(id => id !== user.id);
     if (recipientIds.length === 0) {
         return { success: true, count: 0, memberCount: members.length, message: '班级只有你一人，无需推送。' };
     }
 
-    // 构造 Installation 查询：
-    // - iOS
-    // - 有 token
-    // - user 在 recipients
-    // - notificationsEnabled == true
-    const where = new AV.Query('_Installation');
-    where.equalTo('deviceType', 'ios');
-    where.exists('deviceToken');
-    where.equalTo('notificationsEnabled', true);
-    where.containedIn('user', recipientIds.map(id => AV.Object.createWithoutData('_User', id)));
+    const baseQuery = () => {
+        const q = new AV.Query('_Installation');
+        q.equalTo('deviceType', 'ios');
+        q.exists('deviceToken');
+        q.containedIn('user', recipientIds.map(id => AV.Object.createWithoutData('_User', id)));
+        q.equalTo('notificationsEnabled', true);
+        return q;
+    };
 
-    // 文案
     let alertMessage = '';
     if (alarmType === 'checkin') alertMessage = '班级有同学签到，速来！';
     else if (alarmType === 'rollcall') alertMessage = '老师开始点名，速来！';
     else alertMessage = '快来集合，有情况！';
 
     const data = { alert: alertMessage, sound: 'alarm.caf', badge: 'Increment' };
-    const prod = process.env.PUSH_ENV || 'dev'; // 开发阶段用 dev；TestFlight/上架设为 prod
+    const preferEnv = (process.env.PUSH_ENV || '').toLowerCase();
 
-    // 使用 where（不是 query）
-    await AV.Push.send({ where, data, prod });
-    return { success: true, count: recipientIds.length, memberCount: members.length };
+    try {
+        if (preferEnv === 'dev' || preferEnv === 'prod') {
+            const q = baseQuery(); q.equalTo('pushEnv', preferEnv);
+            console.log(`[sendAlarm] class=${mask(classCode)} sender=${mask(user.id)} env=${preferEnv} pushing`);
+            await AV.Push.send({ where: q, data, prod: preferEnv });
+        } else {
+            const qDev = baseQuery(); qDev.equalTo('pushEnv', 'dev');
+            const qProd = baseQuery(); qProd.equalTo('pushEnv', 'prod');
+            console.log(`[sendAlarm] class=${mask(classCode)} sender=${mask(user.id)} auto route dev+prod`);
+            await Promise.allSettled([
+                AV.Push.send({ where: qDev, data, prod: 'dev' }),
+                AV.Push.send({ where: qProd, data, prod: 'prod' })
+            ]);
+        }
+        return { success: true, count: recipientIds.length, memberCount: members.length };
+    } catch (e) {
+        console.error('推送发送失败');
+        throw new AV.Cloud.Error('推送发送失败，请稍后重试。', { code: 500 });
+    }
 });
