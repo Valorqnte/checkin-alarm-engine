@@ -199,8 +199,7 @@ AV.Cloud.define('getClassInfo', async (request) => {
     };
 });
 
-// 发送闹铃（班级级别 60s 冷却）
-// 发送闹铃：正确筛选 Installation，默认走开发通道（不回滚 lastAlarmAt）
+// 发送闹铃：按 Group.members 推送；不回滚 lastAlarmAt；直推 + 关键日志
 AV.Cloud.define('sendAlarm', async (request) => {
     const user = request.currentUser;
     const { classCode, alarmType } = request.params || {};
@@ -211,14 +210,15 @@ AV.Cloud.define('sendAlarm', async (request) => {
         throw new AV.Cloud.Error('班级码格式不正确。', { code: 400 });
     }
 
-    // 找群组
+    // 取群组
     const gq = new AV.Query('Group');
     gq.equalTo('code', classCode);
     const group = await gq.first();
     if (!group) throw new AV.Cloud.Error('未找到该班级。', { code: 404 });
 
-    // 成员校验
+    // 成员校验（成员应为用户 objectId 字符串数组）
     const members = group.get('members') || [];
+    console.log(`[sendAlarm] class=${classCode} sender=${user.id} members=${JSON.stringify(members)}`);
     if (!members.includes(user.id)) {
         throw new AV.Cloud.Error('你不在该班级中，无法发送提醒。', { code: 403 });
     }
@@ -239,6 +239,7 @@ AV.Cloud.define('sendAlarm', async (request) => {
 
     // 目标用户：排除自己
     const recipientIds = members.filter(id => id !== user.id);
+    console.log(`[sendAlarm] class=${classCode} recipients=${JSON.stringify(recipientIds)}`);
     if (recipientIds.length === 0) {
         return { success: true, count: 0, memberCount: members.length, message: '班级只有你一人，无需推送。' };
     }
@@ -249,13 +250,6 @@ AV.Cloud.define('sendAlarm', async (request) => {
     where.exists('deviceToken');
     where.containedIn('user', recipientIds.map(id => AV.Object.createWithoutData('_User', id)));
 
-    // 统计一下，便于你确认不是“0 目标”
-    const targetCount = await where.count().catch(() => 0);
-    console.log(`[sendAlarm] class=${classCode} sender=${user.id} targetInstallations=${targetCount}`);
-    if (targetCount === 0) {
-        return { success: true, count: 0, memberCount: members.length, message: '没有匹配的目标设备。' };
-    }
-
     // 推送文案
     let alertMessage = '';
     if (alarmType === 'checkin') alertMessage = '班级有同学签到，速来！';
@@ -263,11 +257,9 @@ AV.Cloud.define('sendAlarm', async (request) => {
     else alertMessage = '快来集合，有情况！';
 
     const data = { alert: alertMessage, sound: 'alarm.caf', badge: 'Increment' };
+    const prod = process.env.PUSH_ENV || 'dev'; // 你现在是 Xcode 安装，保持 dev。TestFlight/上架时把环境变量改为 prod。
 
-    // 环境：默认开发通道（Xcode 安装的包）。需要测生产时，到环境变量把 PUSH_ENV 改为 prod。
-    const prod = process.env.PUSH_ENV || 'dev';
-
-    // 注意：LeanCloud Node SDK 正确的参数名是 where（不是 query）
+    console.log(`[sendAlarm] class=${classCode} prod=${prod} pushing...`);
     await AV.Push.send({ where, data, prod });
-    return { success: true, count: targetCount, memberCount: members.length };
+    return { success: true, count: recipientIds.length, memberCount: members.length };
 });
